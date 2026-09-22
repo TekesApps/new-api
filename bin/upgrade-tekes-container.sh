@@ -5,6 +5,7 @@ version="v1.0.0-rc.38-tekes.1"
 archive="new-api-${version}-linux-amd64.tar.gz"
 checksum="new-api-${version}-linux-amd64.sha256"
 release_base="https://github.com/TekesApps/new-api/releases/download/${version}"
+archive_sha256="2542a00ee40ccf5cdab017901666a11f262b9a9b7937ef27b840f2db2c119b7e"
 container="${1:-}"
 
 if [[ -z "$container" ]]; then
@@ -32,9 +33,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-curl --fail --location --retry 3 --output "$work_dir/$archive" "$release_base/$archive"
-curl --fail --location --retry 3 --output "$work_dir/$checksum" \
-    "$release_base/$checksum"
+if [[ -n "${TEKES_NEWAPI_ARCHIVE:-}" ]]; then
+    cp "$TEKES_NEWAPI_ARCHIVE" "$work_dir/$archive"
+    printf '%s  %s\n' "$archive_sha256" "$archive" > "$work_dir/$checksum"
+else
+    curl --fail --location --retry 3 --output "$work_dir/$archive" "$release_base/$archive"
+    curl --fail --location --retry 3 --output "$work_dir/$checksum" \
+        "$release_base/$checksum"
+fi
 (
     cd "$work_dir"
     sha256sum --check "$checksum"
