@@ -270,6 +270,13 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/task_plugin_options", middleware.AdminAuth(), middleware.RequirePermission(authz.TaskPluginBind), controller.GetTaskPluginOptions)
 		registerChannelRoutes(apiRouter)
 		registerAuthzRoutes(apiRouter)
+		adminUserTokenRoute := apiRouter.Group("/admin/users/:user_id/tokens")
+		adminUserTokenRoute.Use(middleware.AdminAuth())
+		{
+			adminUserTokenRoute.POST("/", middleware.CriticalRateLimit(), controller.AdminCreateUserToken)
+			adminUserTokenRoute.POST("/:token_id/disable", controller.AdminDisableUserToken)
+			adminUserTokenRoute.DELETE("/:token_id", controller.AdminDeleteUserToken)
+		}
 		tokenRoute := apiRouter.Group("/token")
 		tokenRoute.Use(middleware.UserAuth())
 		tokenRoute.Use(middleware.TokenOperationAudit())

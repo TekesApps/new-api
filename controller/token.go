@@ -42,6 +42,24 @@ type tokenResponse struct {
 	AutoGroups []string `json:"auto_groups"`
 }
 
+type adminCreateUserTokenRequest struct {
+	Name        string `json:"name"`
+	ExpiredTime int64  `json:"expired_time"`
+	RemainQuota int    `json:"remain_quota"`
+}
+
+type adminUserTokenResponse struct {
+	Id             int    `json:"id"`
+	UserId         int    `json:"user_id"`
+	Key            string `json:"key,omitempty"`
+	Status         int    `json:"status"`
+	Name           string `json:"name"`
+	CreatedTime    int64  `json:"created_time"`
+	ExpiredTime    int64  `json:"expired_time"`
+	RemainQuota    int    `json:"remain_quota"`
+	UnlimitedQuota bool   `json:"unlimited_quota"`
+}
+
 func maxTokenQuota() int {
 	quota, err := common.WalletQuotaFromDecimalStrict(
 		decimal.NewFromInt(1_000_000_000).Mul(decimal.NewFromFloat(common.QuotaPerUnit)),
@@ -356,6 +374,121 @@ func AddToken(c *gin.Context) {
 		"success": true,
 		"message": "",
 	})
+}
+
+// AdminCreateUserToken lets an authenticated administrator issue a bounded,
+// expiring relay token for an existing user. It is intended for trusted backend
+// credential brokers; the raw key is returned only in this creation response.
+func AdminCreateUserToken(c *gin.Context) {
+	userId, err := strconv.Atoi(c.Param("user_id"))
+	if err != nil || userId <= 0 {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	user, err := model.GetUserById(userId, false)
+	if err != nil || user.Status != common.UserStatusEnabled {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+
+	request := adminCreateUserTokenRequest{}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	request.Name = strings.TrimSpace(request.Name)
+	if request.Name == "" || len(request.Name) > 50 ||
+		request.ExpiredTime <= common.GetTimestamp() || request.RemainQuota <= 0 ||
+		request.RemainQuota > maxTokenQuota() {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+
+	count, err := model.CountUserTokens(userId)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if int(count) >= operation_setting.GetMaxUserTokens() {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+
+	key, err := common.GenerateKey()
+	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgTokenGenerateFailed)
+		return
+	}
+	now := common.GetTimestamp()
+	token := model.Token{
+		UserId:         userId,
+		Key:            key,
+		Status:         common.TokenStatusEnabled,
+		Name:           request.Name,
+		CreatedTime:    now,
+		AccessedTime:   now,
+		ExpiredTime:    request.ExpiredTime,
+		RemainQuota:    request.RemainQuota,
+		UnlimitedQuota: false,
+	}
+	if err := token.Insert(); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, adminUserTokenResponse{
+		Id: token.Id, UserId: token.UserId, Key: token.Key, Status: token.Status,
+		Name: token.Name, CreatedTime: token.CreatedTime, ExpiredTime: token.ExpiredTime,
+		RemainQuota: token.RemainQuota, UnlimitedQuota: token.UnlimitedQuota,
+	})
+}
+
+func AdminDisableUserToken(c *gin.Context) {
+	userId, tokenId, ok := adminUserTokenIDs(c)
+	if !ok {
+		return
+	}
+	token, err := model.GetTokenByIds(tokenId, userId)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	token.Status = common.TokenStatusDisabled
+	if err := token.SelectUpdate(); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, adminUserTokenResponse{
+		Id: token.Id, UserId: token.UserId, Status: token.Status, Name: token.Name,
+		CreatedTime: token.CreatedTime, ExpiredTime: token.ExpiredTime,
+		RemainQuota: token.RemainQuota, UnlimitedQuota: token.UnlimitedQuota,
+	})
+}
+
+func AdminDeleteUserToken(c *gin.Context) {
+	userId, tokenId, ok := adminUserTokenIDs(c)
+	if !ok {
+		return
+	}
+	token, err := model.GetTokenByIds(tokenId, userId)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if err := token.Delete(); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"id": tokenId, "user_id": userId})
+}
+
+func adminUserTokenIDs(c *gin.Context) (int, int, bool) {
+	userId, userErr := strconv.Atoi(c.Param("user_id"))
+	tokenId, tokenErr := strconv.Atoi(c.Param("token_id"))
+	if userErr != nil || tokenErr != nil || userId <= 0 || tokenId <= 0 {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return 0, 0, false
+	}
+	return userId, tokenId, true
 }
 
 func DeleteToken(c *gin.Context) {

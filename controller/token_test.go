@@ -48,6 +48,17 @@ type tokenKeyResponse struct {
 	Key string `json:"key"`
 }
 
+type adminUserTokenTestResponse struct {
+	ID             int    `json:"id"`
+	UserID         int    `json:"user_id"`
+	Key            string `json:"key"`
+	Status         int    `json:"status"`
+	Name           string `json:"name"`
+	ExpiredTime    int64  `json:"expired_time"`
+	RemainQuota    int    `json:"remain_quota"`
+	UnlimitedQuota bool   `json:"unlimited_quota"`
+}
+
 type sqliteColumnInfo struct {
 	Name string `gorm:"column:name"`
 	Type string `gorm:"column:type"`
@@ -583,6 +594,106 @@ func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
 	if strings.Contains(unauthorizedRecorder.Body.String(), token.Key) {
 		t.Fatalf("unauthorized key response leaked raw token key: %s", unauthorizedRecorder.Body.String())
 	}
+}
+
+func TestAdminUserTokenLifecycleIsBoundedAndUserScoped(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	user := &model.User{Username: "managed-user", AffCode: "managed-aff", Status: common.UserStatusEnabled, Role: common.RoleCommonUser}
+	other := &model.User{Username: "other-user", AffCode: "other-aff", Status: common.UserStatusEnabled, Role: common.RoleCommonUser}
+	require.NoError(t, db.Create(user).Error)
+	require.NoError(t, db.Create(other).Error)
+
+	expiresAt := common.GetTimestamp() + 3600
+	createCtx, createRecorder := newAuthenticatedContext(t, http.MethodPost, "/api/admin/users/1/tokens/", map[string]any{
+		"name":         "TekesDXF device",
+		"expired_time": expiresAt,
+		"remain_quota": 500_000,
+	}, common.RoleAdminUser)
+	createCtx.Params = gin.Params{{Key: "user_id", Value: strconv.Itoa(user.Id)}}
+	AdminCreateUserToken(createCtx)
+
+	createResponse := decodeAPIResponse(t, createRecorder)
+	require.True(t, createResponse.Success, createResponse.Message)
+	var created adminUserTokenTestResponse
+	require.NoError(t, common.Unmarshal(createResponse.Data, &created))
+	assert.Equal(t, user.Id, created.UserID)
+	assert.Equal(t, "TekesDXF device", created.Name)
+	assert.Equal(t, expiresAt, created.ExpiredTime)
+	assert.Equal(t, 500_000, created.RemainQuota)
+	assert.False(t, created.UnlimitedQuota)
+	assert.NotEmpty(t, created.Key)
+
+	stored, err := model.GetTokenByIds(created.ID, user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, created.Key, stored.Key)
+	assert.False(t, stored.ModelLimitsEnabled)
+
+	reserved, err := model.TryReserveTokenQuota(created.ID, created.Key, 499_999, false)
+	require.NoError(t, err)
+	assert.True(t, reserved)
+	reserved, err = model.TryReserveTokenQuota(created.ID, created.Key, 2, false)
+	require.NoError(t, err)
+	assert.False(t, reserved)
+	stored, err = model.GetTokenByIds(created.ID, user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stored.RemainQuota)
+
+	require.NoError(t, db.Model(&model.Token{}).Where("id = ?", created.ID).
+		Update("expired_time", common.GetTimestamp()-1).Error)
+	_, err = model.ValidateUserToken(created.Key)
+	assert.Error(t, err)
+
+	foreignCtx, foreignRecorder := newAuthenticatedContext(t, http.MethodPost, "/api/admin/users/2/tokens/1/disable", nil, common.RoleAdminUser)
+	foreignCtx.Params = gin.Params{
+		{Key: "user_id", Value: strconv.Itoa(other.Id)},
+		{Key: "token_id", Value: strconv.Itoa(created.ID)},
+	}
+	AdminDisableUserToken(foreignCtx)
+	assert.False(t, decodeAPIResponse(t, foreignRecorder).Success)
+
+	disableCtx, disableRecorder := newAuthenticatedContext(t, http.MethodPost, "/api/admin/users/1/tokens/1/disable", nil, common.RoleAdminUser)
+	disableCtx.Params = gin.Params{
+		{Key: "user_id", Value: strconv.Itoa(user.Id)},
+		{Key: "token_id", Value: strconv.Itoa(created.ID)},
+	}
+	AdminDisableUserToken(disableCtx)
+	disableResponse := decodeAPIResponse(t, disableRecorder)
+	require.True(t, disableResponse.Success, disableResponse.Message)
+	_, err = model.ValidateUserToken(created.Key)
+	assert.Error(t, err)
+
+	deleteCtx, deleteRecorder := newAuthenticatedContext(t, http.MethodDelete, "/api/admin/users/1/tokens/1", nil, common.RoleAdminUser)
+	deleteCtx.Params = gin.Params{
+		{Key: "user_id", Value: strconv.Itoa(user.Id)},
+		{Key: "token_id", Value: strconv.Itoa(created.ID)},
+	}
+	AdminDeleteUserToken(deleteCtx)
+	deleteResponse := decodeAPIResponse(t, deleteRecorder)
+	require.True(t, deleteResponse.Success, deleteResponse.Message)
+	_, err = model.GetTokenByIds(created.ID, user.Id)
+	assert.Error(t, err)
+}
+
+func TestAdminCreateUserTokenRejectsUnboundedOrExpiredCredentials(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}))
+	user := &model.User{Username: "managed-user", AffCode: "bounded-aff", Status: common.UserStatusEnabled, Role: common.RoleCommonUser}
+	require.NoError(t, db.Create(user).Error)
+
+	for _, body := range []map[string]any{
+		{"name": "", "expired_time": common.GetTimestamp() + 3600, "remain_quota": 1},
+		{"name": "device", "expired_time": common.GetTimestamp() - 1, "remain_quota": 1},
+		{"name": "device", "expired_time": common.GetTimestamp() + 3600, "remain_quota": 0},
+	} {
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/admin/users/1/tokens/", body, common.RoleAdminUser)
+		ctx.Params = gin.Params{{Key: "user_id", Value: strconv.Itoa(user.Id)}}
+		AdminCreateUserToken(ctx)
+		assert.False(t, decodeAPIResponse(t, recorder).Success)
+	}
+	count, err := model.CountUserTokens(user.Id)
+	require.NoError(t, err)
+	assert.Zero(t, count)
 }
 
 func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
